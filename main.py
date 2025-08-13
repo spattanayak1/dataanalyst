@@ -1061,11 +1061,9 @@ async def aianalyst(request: Request):
     for file in uploaded_files:
         print(f"  📄 {file.filename} (field: {[k for k, v in form.items() if v == file][0]})")
  
-    import tempfile
     time_start = time.time()
-    # Use cross-platform temp directory
-    temp_dir = tempfile.gettempdir()
-    initial_snapshot = _snapshot_files(temp_dir)
+    # Track files created during this request
+    initial_snapshot = _snapshot_files("/tmp")
     created_files: set[str] = set()
     
     # Initialize file type variables
@@ -1257,10 +1255,9 @@ async def aianalyst(request: Request):
         task_breaked = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         task_breaked = f"1. Read question (Task breaker fallback due to error: {e})"  # fallback minimal content
-    broken_down_tasks_path = os.path.join(temp_dir, "broken_down_tasks.txt")
-    with open(broken_down_tasks_path, "w", encoding="utf-8") as f:
+    with open("/tmp/broken_down_tasks.txt", "w", encoding="utf-8") as f:
         f.write(str(task_breaked))
-    created_files.add(os.path.normpath(broken_down_tasks_path))
+    created_files.add(os.path.normpath("/tmp/broken_down_tasks.txt"))
 
     # Proceed with remaining steps (CSV/HTML/JSON processing, source extraction, etc.)
     # ----------------------------------------------------------------------
@@ -1809,10 +1806,9 @@ async def aianalyst(request: Request):
     )
     
     # Save data summary for debugging
-    data_summary_path = os.path.join(temp_dir, "data_summary.json")
-    with open(data_summary_path, "w", encoding="utf-8") as f:
+    with open("/tmp/data_summary.json", "w", encoding="utf-8") as f:
         json.dump(make_json_serializable(data_summary), f, indent=2)
-    created_files.add(os.path.normpath(data_summary_path))
+    created_files.add(os.path.normpath("/tmp/data_summary.json"))
 
     print(f"📋 Data Summary: {data_summary['total_sources']} total sources")
 
@@ -1850,70 +1846,66 @@ async def aianalyst(request: Request):
             media_type="application/json"
         )
 
-    # Check if raw_code is a string before splitting
-    import tempfile
-    temp_dir = tempfile.gettempdir()
-    if isinstance(raw_code, str):
-        lines = raw_code.split('\n')
-        clean_lines = []
-        in_code_block = False
-        for line in lines:
-            if line.strip().startswith('```'):
-                in_code_block = not in_code_block
-                continue
-            if in_code_block or (not line.strip().startswith('```') and '```' not in line):
-                clean_lines.append(line)
+    
+    lines = raw_code.split('\n')
+    clean_lines = []
+    in_code_block = False
 
-        cleaned_code = '\n'.join(clean_lines).strip()
-        chatgpt_code_path = os.path.join(temp_dir, "chatgpt_code.py")
-        with open(chatgpt_code_path, "w", encoding="utf-8", errors="replace") as f:
-            f.write(cleaned_code)
-        created_files.add(os.path.normpath(chatgpt_code_path))
-        # Execute the code
-        try:
-            pre_exec_snapshot = _snapshot_files(temp_dir)
-            result = subprocess.run(
-                ["python", chatgpt_code_path],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-            if result.returncode == 0:
-                stdout = result.stdout.strip()
-                json_output = extract_json_from_output(stdout)
-                
-                if is_valid_json_output(json_output):
-                    try:
-                        output_data = json.loads(json_output)
-                        print("✅ Code executed successfully")
-                        
-                        # Cleanup generated files before returning
-                        post_exec_snapshot = _snapshot_files(temp_dir)
-                        new_files = post_exec_snapshot - pre_exec_snapshot
-                        files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
-                        _cleanup_created_files(files_to_delete)
-                        
-                        return JSONResponse(
-                            content=output_data,
-                            media_type="application/json"
-                        )
-                    except json.JSONDecodeError as e:
-                        print(f"JSON decode error: {str(e)[:100]}")
-            else:
-                print(f"Execution error: {result.stderr}")
+    for line in lines:
+        if line.strip().startswith('```'):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block or (not line.strip().startswith('```') and '```' not in line):
+            clean_lines.append(line)
 
-        except subprocess.TimeoutExpired:
-            print("Code execution timed out")
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-    else:
-        # raw_code is not a string (likely an error dict), handle gracefully
-        print(f"Gemini Pro API did not return code: {raw_code}")
-        fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in application/json fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
-        return JSONResponse(
-            content=fake_answer["choices"][0]["message"]["content"],
-            media_type="application/json"
+    cleaned_code = '\n'.join(clean_lines).strip()
+
+    # Write generated code using UTF-8 to avoid Windows cp1252 encode errors (e.g. for narrow no-break space \u202f)
+    with open("/tmp/chatgpt_code.py", "w", encoding="utf-8", errors="replace") as f:
+        f.write(cleaned_code)
+    created_files.add(os.path.normpath("/tmp/chatgpt_code.py"))
+
+    # Execute the code
+    try:
+        # Snapshot before executing generated code to catch any new files it creates
+        pre_exec_snapshot = _snapshot_files("/tmp")
+        result = subprocess.run(
+            ["python", "/tmp/chatgpt_code.py"],
+            capture_output=True,
+            text=True,
+            timeout=120
         )
+
+        if result.returncode == 0:
+            stdout = result.stdout.strip()
+            json_output = extract_json_from_output(stdout)
+            
+            if is_valid_json_output(json_output):
+                try:
+                    output_data = json.loads(json_output)
+                    print("✅ Code executed successfully")
+                    
+                    # Cleanup generated files before returning
+                    post_exec_snapshot = _snapshot_files("/tmp")
+                    new_files = post_exec_snapshot - pre_exec_snapshot
+                    files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
+                    _cleanup_created_files(files_to_delete)
+                    
+                    return JSONResponse(
+                        content=output_data,
+                        media_type="application/json"
+                    )
+                except json.JSONDecodeError as e:
+                    print(f"JSON decode error: {str(e)[:100]}")
+            else:
+                print(f"Output doesn't look like JSON: {json_output[:100]}")
+        else:
+            print(f"Execution error: {result.stderr}")
+
+    except subprocess.TimeoutExpired:
+        print("Code execution timed out")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
 
     # Code fixing attempts (existing logic)
     max_fix_attempts = 3
@@ -1929,7 +1921,7 @@ async def aianalyst(request: Request):
             
             try:
                 # Snapshot for this fix attempt
-                fix_pre_exec_snapshot = _snapshot_files(temp_dir)
+                fix_pre_exec_snapshot = _snapshot_files("/tmp")
                 result = subprocess.run(
                     ["python", "/tmp/chatgpt_code.py"],
                     capture_output=True,
@@ -2020,7 +2012,7 @@ async def aianalyst(request: Request):
                         print(f"✅ Code fixed and executed successfully on fix attempt {fix_attempt}")
                         
                         # Cleanup generated files before returning
-                        post_exec_snapshot = _snapshot_files(temp_dir)
+                        post_exec_snapshot = _snapshot_files("/tmp")
                         # Prefer fix attempt snapshot if present
                         new_files = post_exec_snapshot - (fix_pre_exec_snapshot if 'fix_pre_exec_snapshot' in locals() else pre_exec_snapshot)
                         files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
@@ -2046,7 +2038,7 @@ async def aianalyst(request: Request):
     print("❌ All code execution attempts failed")
     
     # Cleanup generated files before returning error
-    final_snapshot = _snapshot_files(temp_dir)
+    final_snapshot = _snapshot_files("/tmp")
     new_files = final_snapshot - initial_snapshot
     files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
     fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in application/json fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
